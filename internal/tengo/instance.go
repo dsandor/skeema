@@ -14,6 +14,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/snowflakedb/gosnowflake"
 )
 
 // Instance represents a single database server running on a specific host or address.
@@ -25,6 +27,10 @@ type Instance struct {
 	Host            string
 	Port            int
 	SocketPath      string
+	Account         string
+	Database        string
+	Role            string
+	Warehouse       string
 	defaultParams   map[string]string
 	connectionPool  map[string]*sqlx.DB // key is in format "schema?params"
 	m               *sync.Mutex         // protects unexported fields for concurrent operations
@@ -46,12 +52,64 @@ type Instance struct {
 // applied as default params to all connections (in addition to whatever is
 // supplied in Connect).
 func NewInstance(driver, dsn string) (*Instance, error) {
-	if driver != "mysql" {
+	if driver != "mysql" && driver != "snowflake" {
 		return nil, fmt.Errorf("Unsupported driver \"%s\"", driver)
 	}
 
+	var instance *Instance
+	var err error
+
+	if driver == "mysql" {
+		instance, err = parseMysqlConfig(dsn)
+	} else if driver == "snowflake" {
+		instance, err = parseSnowflakeConfig(dsn)
+	}
+
+	return instance, err
+}
+
+// parseSnowflakeConfig Parses a valid dsn for snowflake connection configuration information.
+// Valid dsn formats:
+// user[:password]@account/database/schema[?param1=value1&paramN=valueN]
+// or
+// user[:password]@account/database[?param1=value1&paramN=valueN]
+// or
+// user[:password]@host:port/database/schema?account=user_account[?param1=value1&paramN=valueN]
+// or
+// host:port/database/schema?account=user_account[?param1=value1&paramN=valueN]
+
+func parseSnowflakeConfig(dsn string) (*Instance, error) {
 	base := baseDSN(dsn)
 	params := paramMap(dsn)
+
+	parsedConfig, err := gosnowflake.ParseDSN(dsn)
+
+	if err != nil {
+		return nil, err
+	}
+
+	instance := &Instance{
+		BaseDSN:        base,
+		Driver:         "snowflake",
+		User:           parsedConfig.User,
+		Password:       parsedConfig.Password,
+		defaultParams:  params,
+		connectionPool: make(map[string]*sqlx.DB),
+		flavor:         FlavorSnowflake1,
+		m:              new(sync.Mutex),
+		Database:       parsedConfig.Database,
+		Role:           parsedConfig.Role,
+		Warehouse:      parsedConfig.Warehouse,
+		Account:        parsedConfig.Account,
+	}
+
+	return instance, err
+}
+
+func parseMysqlConfig(dsn string) (*Instance, error) {
+	base := baseDSN(dsn)
+	params := paramMap(dsn)
+
 	parsedConfig, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -59,7 +117,7 @@ func NewInstance(driver, dsn string) (*Instance, error) {
 
 	instance := &Instance{
 		BaseDSN:        base,
-		Driver:         driver,
+		Driver:         "mysql",
 		User:           parsedConfig.User,
 		Password:       parsedConfig.Passwd,
 		defaultParams:  params,
@@ -79,7 +137,7 @@ func NewInstance(driver, dsn string) (*Instance, error) {
 		}
 	}
 
-	return instance, nil
+	return instance, err
 }
 
 // String for an instance returns a "host:port" string (or "localhost:/path/to/socket"
@@ -285,29 +343,49 @@ func (instance *Instance) hydrateVars(db *sqlx.DB, lock bool) {
 		}
 	}
 	var result struct {
-		VersionComment      string
-		Version             string
-		SQLMode             string
-		WaitTimeout         int
-		LockWaitTimeout     int
-		MaxUserConns        int
-		MaxConns            int
-		BufferPoolSize      int64
-		LowerCaseTableNames int
+		VersionComment      string `db:"VERSIONCOMMENT"`
+		Version             string `db:"VERSION"`
+		SQLMode             string `db:"SQLMODE"`
+		WaitTimeout         int    `db:"WAITTIMEOUT"`
+		LockWaitTimeout     int    `db:"LOCKWAITTIMEOUT"`
+		MaxUserConns        int    `db:"MAXUSERCONNS"`
+		MaxConns            int    `db:"MAXCONNS"`
+		BufferPoolSize      int64  `db:"BUFFERPOOLSIZE"`
+		LowerCaseTableNames int    `db:"LOWERCASETABLENAMES"`
 	}
-	query := `
-		SELECT @@global.version_comment AS versioncomment,
-		       @@global.version AS version,
-		       @@session.sql_mode AS sqlmode,
-		       @@session.wait_timeout AS waittimeout,
-		       @@session.lock_wait_timeout AS lockwaittimeout,
-		       @@global.innodb_buffer_pool_size AS bufferpoolsize,
-		       @@global.lower_case_table_names as lowercasetablenames,
-		       @@session.max_user_connections AS maxuserconns,
-		       @@global.max_connections AS maxconns`
+
+	var query string
+
+	if instance.Driver == "snowflake" {
+		query = `
+		SELECT 
+				'snowflake' as VERSIONCOMMENT,
+				CURRENT_VERSION() as VERSION,
+				'STRICT_TRANS_TABLES' as SQLMODE,
+				30 as WAITTIMEOUT,
+				30 as LOCKWAITTIMEOUT,
+				0 as BUFFERPOOLSIZE,
+				1 as LOWERCASETABLENAMES,
+				10 as MAXUSERCONNS,
+				10 as MAXCONNS
+		LIMIT 1;`
+	} else {
+		query = `
+		SELECT @@global.version_comment AS VERSIONCOMMENT,
+		       @@global.version AS VERSION,
+		       @@session.sql_mode AS SQLMODE,
+		       @@session.wait_timeout AS WAITTIMEOUT,
+		       @@session.lock_wait_timeout AS LOCKWAITTIMEOUT,
+		       @@global.innodb_buffer_pool_size AS BUFFERPOOLSIZE,
+		       @@global.lower_case_table_names as LOWERCASETABLENAMES,
+		       @@session.max_user_connections AS MAXUSERCONNS,
+		       @@global.max_connections AS MAXCONNS`
+	}
+
 	if err = db.Get(&result, query); err != nil {
 		return
 	}
+
 	instance.valid = true
 	instance.flavor = IdentifyFlavor(result.Version, result.VersionComment)
 	instance.sqlMode = strings.Split(result.SQLMode, ",")
@@ -370,7 +448,7 @@ func (instance *Instance) SchemaNames() ([]string, error) {
 	query := `
 		SELECT schema_name
 		FROM   information_schema.schemata
-		WHERE  schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'test', 'sys')`
+		WHERE  UPPER(schema_name) NOT IN ('INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA', 'MYSQL', 'TEST', 'SYS')`
 	if err := db.Select(&result, query); err != nil {
 		return nil, err
 	}
@@ -387,9 +465,9 @@ func (instance *Instance) Schemas(onlyNames ...string) ([]*Schema, error) {
 		return nil, err
 	}
 	var rawSchemas []struct {
-		Name      string `db:"schema_name"`
-		CharSet   string `db:"default_character_set_name"`
-		Collation string `db:"default_collation_name"`
+		Name      string `db:"SCHEMA_NAME"`
+		CharSet   string `db:"DEFAULT_CHARACTER_SET_NAME"`
+		Collation string `db:"DEFAULT_COLLATION_NAME"`
 	}
 
 	var args []interface{}
@@ -399,11 +477,21 @@ func (instance *Instance) Schemas(onlyNames ...string) ([]*Schema, error) {
 	// come back from queries in all caps, so we need to explicitly use AS clauses
 	// in order to get them back as lowercase and have sqlx Select() work
 	if len(onlyNames) == 0 {
-		query = `
-			SELECT schema_name AS schema_name, default_character_set_name AS default_character_set_name,
-			       default_collation_name AS default_collation_name
+		if instance.Driver == "snowflake" {
+			query = `
+			SELECT schema_name AS SCHEMA_NAME, 
+			       'utf-8' AS DEFAULT_CHARACTER_SET_NAME,
+			       'utf8' AS DEFAULT_COLLATION_NAME
+			FROM   INFORMATION_SCHEMA.SCHEMATA
+			WHERE  UPPER(SCHEMA_NAME) NOT IN ('INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA', 'MYSQL', 'TEST', 'SYS')`
+		} else {
+			query = `
+			SELECT schema_name AS SCHEMA_NAME, default_character_set_name AS DEFAULT_CHARACTER_SET_NAME,
+			       default_collation_name AS DEFAULT_COLLATION_NAME
 			FROM   information_schema.schemata
-			WHERE  schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'test', 'sys')`
+			WHERE  UPPER(schema_name) NOT IN ('INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA', 'MYSQL', 'TEST', 'SYS')`
+
+		}
 	} else {
 		// If instance is using lower_case_table_names=2, apply an explicit collation
 		// to ensure the schema name comes back with its original lettercasing. See
@@ -412,11 +500,23 @@ func (instance *Instance) Schemas(onlyNames ...string) ([]*Schema, error) {
 		if instance.NameCaseMode() == NameCaseInsensitive {
 			lctn2Collation = " COLLATE utf8_general_ci"
 		}
-		query = fmt.Sprintf(`
-			SELECT schema_name AS schema_name, default_character_set_name AS default_character_set_name,
-			       default_collation_name AS default_collation_name
+		if instance.Driver == "snowflake" {
+			query = `
+			SELECT SCHEMA_NAME AS SCHEMA_NAME, 
+			       'utf8' AS DEFAULT_CHARACTER_SET_NAME,
+			       'utf8' AS DEFAULT_COLLATION_NAME
+			FROM   INFORMATION_SCHEMA.SCHEMATA
+			WHERE  SCHEMA_NAME IN (?)`
+
+		} else {
+			query = fmt.Sprintf(`
+			SELECT schema_name AS SCHEMA_NAME, default_character_set_name AS DEFAULT_CHARACTER_SET_NAME,
+			       default_collation_name AS DEFAULT_COLLATION_NAME
 			FROM   information_schema.schemata
 			WHERE  schema_name%s IN (?)`, lctn2Collation)
+
+		}
+
 		query, args, err = sqlx.In(query, onlyNames)
 	}
 	if err := db.Select(&rawSchemas, query, args...); err != nil {
@@ -525,7 +625,7 @@ func (instance *Instance) ShowCreateTable(schema, table string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return showCreateTable(context.Background(), db, table)
+	return showCreateTable(context.Background(), db, table, schema, instance.flavor)
 }
 
 // introspectionParams returns a params string which ensures safe session
@@ -571,12 +671,20 @@ func (instance *Instance) introspectionParams() string {
 	return v.Encode()
 }
 
-func showCreateTable(ctx context.Context, db *sqlx.DB, table string) (string, error) {
+func showCreateTable(ctx context.Context, db *sqlx.DB, table string, schmea string, flavor Flavor) (string, error) {
 	var row struct {
 		TableName       string `db:"Table"`
 		CreateStatement string `db:"Create Table"`
 	}
-	query := fmt.Sprintf("SHOW CREATE TABLE %s", EscapeIdentifier(table))
+
+	var query string
+
+	if flavor.Vendor == VendorSnowflake {
+		query = fmt.Sprintf("select GET_DDL('TABLE', '%s.%s') as \"Create Table\", '%s' as \"Table\"", schmea, table, table)
+	} else {
+		query = fmt.Sprintf("SHOW CREATE TABLE %s", EscapeIdentifier(table))
+	}
+
 	if err := db.GetContext(ctx, &row, query); err != nil {
 		return "", err
 	}
@@ -876,10 +984,20 @@ func (instance *Instance) DropRoutinesInSchema(schema string, opts BulkDropOptio
 			routineInfo[n].Type = string(routine.Type)
 		}
 	} else {
-		query := `
+		var query string
+
+		if instance.Driver == "snowflake" {
+			query = `
+			SELECT FUNCTION_NAME AS routine_name, UPPER(DATA_TYPE) AS routine_type
+			FROM   INFORMATION_SCHEMA.FUNCTIONS
+			WHERE  FUNCTION_SCHEMA = ?`
+		} else {
+			query = `
 			SELECT routine_name AS routine_name, UPPER(routine_type) AS routine_type
 			FROM   information_schema.routines
 			WHERE  routine_schema = ?`
+		}
+
 		if err := db.Select(&routineInfo, query, schema); err != nil {
 			return err
 		}

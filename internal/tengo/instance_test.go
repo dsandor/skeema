@@ -34,6 +34,18 @@ func TestNewInstance(t *testing.T) {
 		}
 	}
 
+	assertSnowflakeInstance := func(dsn string, expectedInstance Instance) {
+		expectedInstance.connectionPool = make(map[string]*sqlx.DB)
+		instance, err := NewInstance("snowflake", dsn)
+		if err != nil {
+			t.Fatalf("Unexpectedly received error %s from NewInstance(\"mysql\", \"%s\")", err, dsn)
+		}
+		expectedInstance.m = instance.m // cheat to satisfy DeepEqual
+		if !reflect.DeepEqual(expectedInstance, *instance) {
+			t.Errorf("NewInstance(\"snowflake\", \"%s\"): Returned instance %#v does not match expected instance %#v", dsn, *instance, expectedInstance)
+		}
+	}
+
 	dsn := "username:password@tcp(some.host:1234)/dbname"
 	expected := Instance{
 		BaseDSN:       "username:password@tcp(some.host:1234)/",
@@ -74,6 +86,24 @@ func TestNewInstance(t *testing.T) {
 		},
 	}
 	assertInstance(dsn, expected)
+
+	// user[:password]@account/database/schema
+	dsn = "myuser:mypassword@wvb12437/PETSHOP/CORE?warehouse=COMPUTE_WH&role=SYSADMIN"
+	expected = Instance{
+		BaseDSN:   "myuser:mypassword@wvb12437/PETSHOP/",
+		Driver:    "snowflake",
+		User:      "myuser",
+		Password:  "mypassword",
+		Database:  "PETSHOP",
+		Account:   "wvb12437",
+		Warehouse: "COMPUTE_WH",
+		Role:      "SYSADMIN",
+		defaultParams: map[string]string{
+			"warehouse": "COMPUTE_WH",
+			"role":      "SYSADMIN",
+		},
+	}
+	assertSnowflakeInstance(dsn, expected)
 }
 
 func TestInstanceBuildParamString(t *testing.T) {

@@ -35,6 +35,8 @@ func init() {
 	cmd.AddOption(mybase.StringOption("schema", 0, "", "Only import the one specified schema; skip creation of subdirs for each schema"))
 	cmd.AddOption(mybase.BoolOption("include-auto-inc", 0, false, "Include starting auto-inc values in table files"))
 	cmd.AddOption(mybase.BoolOption("strip-partitioning", 0, false, "Omit PARTITION BY clause when writing partitioned tables to filesystem"))
+	cmd.AddOption(mybase.StringOption("dsn", 'D', "", "DSN for database connection"))
+	cmd.AddOption(mybase.StringOption("driver", 'R', "mysql", "Specify a driver explicitly: mysql or snowflake"))
 
 	// The temp-schema option is normally added via workspace.AddCommandOptions()
 	// only in subcommands that actually interact with workspaces. init doesn't use
@@ -121,7 +123,9 @@ func createHostDir(cfg *mybase.Config) (*fs.Dir, error) {
 	if !cfg.OnCLI("host") {
 		return nil, NewExitValue(CodeBadConfig, "Option --host must be supplied on the command-line")
 	}
+
 	hostDirName := cfg.Get("dir")
+
 	if !cfg.Changed("dir") { // default for dir is to base it on the hostname
 		hostDirName = fs.HostDefaultDirName(cfg.Get("host"), cfg.GetIntOrDefault("port"))
 	}
@@ -151,7 +155,12 @@ func createHostOptionFile(cfg *mybase.Config, hostDir *fs.Dir, inst *tengo.Insta
 		hostOptionFile.SetOptionValue(environment, "host", "localhost")
 		hostOptionFile.SetOptionValue(environment, "socket", inst.SocketPath)
 	} else {
-		hostOptionFile.SetOptionValue(environment, "host", inst.Host)
+		if inst.Driver == "snowflake" {
+			hostOptionFile.SetOptionValue(environment, "host", inst.Account)
+		} else {
+			hostOptionFile.SetOptionValue(environment, "host", inst.Host)
+		}
+
 		hostOptionFile.SetOptionValue(environment, "port", strconv.Itoa(inst.Port))
 	}
 	if !cfg.Changed("generator") {
@@ -172,8 +181,13 @@ func createHostOptionFile(cfg *mybase.Config, hostDir *fs.Dir, inst *tengo.Insta
 	// between environments.
 	if cfg.Changed("schema") {
 		hostOptionFile.SetOptionValue("", "schema", cfg.Get("schema"))
-		hostOptionFile.SetOptionValue("", "default-character-set", schemas[0].CharSet)
-		hostOptionFile.SetOptionValue("", "default-collation", schemas[0].Collation)
+		if inst.Driver == "snowflake" {
+			hostOptionFile.SetOptionValue("", "default-character-set", "utf8")
+			hostOptionFile.SetOptionValue("", "default-collation", "en")
+		} else {
+			hostOptionFile.SetOptionValue("", "default-character-set", schemas[0].CharSet)
+			hostOptionFile.SetOptionValue("", "default-collation", schemas[0].Collation)
+		}
 	}
 
 	// Write the option file

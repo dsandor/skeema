@@ -1,0 +1,6 @@
+generator=skeema:1.9.0-community
+
+[production]
+flavor=snowflake:7.14
+host=wvb12437
+port=0

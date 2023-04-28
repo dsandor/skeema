@@ -32,7 +32,7 @@ func querySchemaTables(ctx context.Context, db *sqlx.DB, schema string, flavor F
 	for n := range tables {
 		t := tables[n] // avoid issues with goroutines and loop iterator values
 		g.Go(func() (err error) {
-			t.CreateStatement, err = showCreateTable(subCtx, db, t.Name)
+			t.CreateStatement, err = showCreateTable(subCtx, db, t.Name, schema, flavor)
 			if err != nil {
 				err = fmt.Errorf("Error executing SHOW CREATE TABLE for %s.%s: %s", EscapeIdentifier(schema), EscapeIdentifier(t.Name), err)
 			}
@@ -168,25 +168,46 @@ func querySchemaTables(ctx context.Context, db *sqlx.DB, schema string, flavor F
 
 func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor Flavor) ([]*Table, bool, error) {
 	var rawTables []struct {
-		Name               string         `db:"table_name"`
-		Type               string         `db:"table_type"`
-		Engine             sql.NullString `db:"engine"`
-		TableCollation     sql.NullString `db:"table_collation"`
-		CreateOptions      sql.NullString `db:"create_options"`
-		Comment            string         `db:"table_comment"`
-		CharSet            string         `db:"character_set_name"`
-		CollationIsDefault string         `db:"is_default"`
+		Name               string         `db:"TABLE_NAME"`
+		Type               string         `db:"TABLE_TYPE"`
+		Engine             sql.NullString `db:"ENGINE"`
+		TableCollation     sql.NullString `db:"TABLE_COLLATION"`
+		CreateOptions      sql.NullString `db:"CREATE_OPTIONS"`
+		Comment            sql.NullString `db:"TABLE_COMMENT"`
+		CharSet            string         `db:"CHARACTER_SET_NAME"`
+		CollationIsDefault string         `db:"IS_DEFAULT"`
 	}
-	query := `
+	var query string
+	if flavor.IsSnowflake() {
+		query = `SELECT 
+		       t.table_name 	as TABLE_NAME, 
+		       t.table_type 	as TABLE_TYPE,
+		        '' 				as TABLE_COLLATION,
+		       '' 				as CREATE_OPTIONS,
+		       'UTF-8' 			as CHARACTER_SET_NAME, 
+		       true 			as IS_DEFAULT
+               , t.COMMENT 		as TABLE_COMMENT
+               , 'Snowflake' 	as ENGINE
+		FROM   information_schema.tables t
+		WHERE  t.table_schema = ?
+		AND    t.table_type = 'BASE TABLE'`
+	} else {
+		query = `
 		SELECT SQL_BUFFER_RESULT
-		       t.table_name AS table_name, t.table_type AS table_type,
-		       t.engine AS engine, t.table_collation AS table_collation,
-		       t.create_options AS create_options, t.table_comment AS table_comment,
-		       c.character_set_name AS character_set_name, c.is_default AS is_default
+		       t.table_name 		AS TABLE_NAME,
+		       t.table_type 		AS TABLE_TYPE,
+		       t.engine 			AS ENGINE, 
+		       t.table_collation 	AS TABLE_COLLATION,
+		       t.create_options 	AS CREATE_OPTIONS, 
+		       t.table_comment 		AS TABLE_COMMENT,
+		       c.character_set_name AS CHARACTER_SET_NAME, 
+		       c.is_default 		AS IS_DEFAULT
 		FROM   information_schema.tables t
 		JOIN   information_schema.collations c ON t.table_collation = c.collation_name
 		WHERE  t.table_schema = ?
 		AND    t.table_type = 'BASE TABLE'`
+
+	}
 	if err := db.SelectContext(ctx, &rawTables, query, schema); err != nil {
 		return nil, false, fmt.Errorf("Error querying information_schema.tables for schema %s: %s", schema, err)
 	}
@@ -206,7 +227,7 @@ func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor
 			CharSet:            rawTable.CharSet,
 			Collation:          rawTable.TableCollation.String,
 			CollationIsDefault: rawTable.CollationIsDefault != "",
-			Comment:            rawTable.Comment,
+			Comment:            rawTable.Comment.String,
 		}
 		if rawTable.CreateOptions.Valid && rawTable.CreateOptions.String != "" {
 			if strings.Contains(strings.ToUpper(rawTable.CreateOptions.String), "PARTITIONED") {
@@ -221,36 +242,62 @@ func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor
 func queryColumnsInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor Flavor) (map[string][]*Column, error) {
 	stripDisplayWidth := flavor.OmitIntDisplayWidth()
 	var rawColumns []struct {
-		Name               string         `db:"column_name"`
-		TableName          string         `db:"table_name"`
-		Type               string         `db:"column_type"`
-		IsNullable         string         `db:"is_nullable"`
-		Default            sql.NullString `db:"column_default"`
-		Extra              string         `db:"extra"`
-		GenerationExpr     sql.NullString `db:"generation_expression"`
-		Comment            string         `db:"column_comment"`
-		CharSet            sql.NullString `db:"character_set_name"`
-		Collation          sql.NullString `db:"collation_name"`
-		CollationIsDefault sql.NullString `db:"is_default"`
+		Name               string         `db:"COLUMN_NAME"`
+		TableName          string         `db:"TABLE_NAME"`
+		Type               string         `db:"COLUMN_TYPE"`
+		IsNullable         string         `db:"IS_NULLABLE"`
+		Default            sql.NullString `db:"COLUMN_DEFAULT"`
+		Extra              string         `db:"EXTRA"`
+		GenerationExpr     sql.NullString `db:"GENERATION_EXPRESSION"`
+		Comment            string         `db:"COLUMN_COMMENT"`
+		CharSet            sql.NullString `db:"CHARACTER_SET_NAME"`
+		Collation          sql.NullString `db:"COLLATION_NAME"`
+		CollationIsDefault sql.NullString `db:"IS_DEFAULT"`
 	}
-	query := `
+
+	var query string
+
+	if flavor.Vendor == VendorSnowflake {
+		query = `SELECT    
+		          c.table_name AS TABLE_NAME, 
+		          c.column_name AS COLUMN_NAME,
+		          c.data_type AS COLUMN_TYPE, 
+		          c.is_nullable AS IS_NULLABLE,
+		          coalesce(c.column_default, '') AS COLUMN_DEFAULT, 
+		          case when c.is_identity = 'YES' then 'auto_increment' else '' end AS EXTRA,
+		          coalesce(c.comment, '') AS COLUMN_COMMENT,
+		          coalesce(c.character_set_name, 'utf8') AS CHARACTER_SET_NAME,
+		          coalesce(c.collation_name, 'en') AS COLLATION_NAME, 
+		          true AS is_default
+		FROM      information_schema.columns c
+		WHERE     c.table_schema = ?
+		ORDER BY  c.table_name, c.ordinal_position;`
+	} else {
+		query = `
 		SELECT    SQL_BUFFER_RESULT
-		          c.table_name AS table_name, c.column_name AS column_name,
-		          c.column_type AS column_type, c.is_nullable AS is_nullable,
-		          c.column_default AS column_default, c.extra AS extra,
-		          %s AS generation_expression,
-		          c.column_comment AS column_comment,
-		          c.character_set_name AS character_set_name,
-		          c.collation_name AS collation_name, co.is_default AS is_default
+		          c.table_name AS TABLE_NAME, 
+		          c.column_name AS COLUMN_NAME,
+		          c.column_type AS COLUMN_TYPE, 
+		          c.is_nullable AS IS_NULLABLE,
+		          c.column_default AS COLUMN_DEFAULT, 
+		          c.extra AS EXTRA,
+		          %s AS GENERATION_EXPRESSION,
+		          c.column_comment AS COLUMN_COMMENT,
+		          c.character_set_name AS CHARACTER_SET_NAME,
+		          c.collation_name AS COLLATION_NAME, 
+		    co.is_default AS is_default
 		FROM      information_schema.columns c
 		LEFT JOIN information_schema.collations co ON co.collation_name = c.collation_name
 		WHERE     c.table_schema = ?
 		ORDER BY  c.table_name, c.ordinal_position`
-	genExpr := "NULL"
-	if flavor.GeneratedColumns() {
-		genExpr = "c.generation_expression"
+
+		genExpr := "NULL"
+		if flavor.GeneratedColumns() {
+			genExpr = "c.generation_expression"
+		}
+		query = fmt.Sprintf(query, genExpr)
 	}
-	query = fmt.Sprintf(query, genExpr)
+
 	if err := db.SelectContext(ctx, &rawColumns, query, schema); err != nil {
 		return nil, fmt.Errorf("Error querying information_schema.columns for schema %s: %s", schema, err)
 	}
@@ -336,6 +383,11 @@ func queryColumnsInSchema(ctx context.Context, db *sqlx.DB, schema string, flavo
 }
 
 func queryIndexesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor Flavor) (map[string]*Index, map[string][]*Index, error) {
+	if flavor.Vendor == VendorSnowflake {
+		// NOTE: Snowflake does not have a statistics table in information_schema. Need to figure out how to gather this
+		// information.
+		return nil, nil, nil
+	}
 	var rawIndexes []struct {
 		Name       string         `db:"index_name"`
 		TableName  string         `db:"table_name"`
@@ -436,7 +488,36 @@ func queryForeignKeysInSchema(ctx context.Context, db *sqlx.DB, schema string, f
 		ReferencedSchemaName string `db:"referenced_schema"`
 		ReferencedColumnName string `db:"referenced_column_name"`
 	}
-	query := `
+	var query string
+	if flavor.Vendor == VendorSnowflake {
+		return nil, nil
+		// NOTE: This does not work because the last query is not deterministic and snowflake has no fk column information
+		// in the information schema like mysql does.
+		// Ref: https://community.snowflake.com/s/question/0D50Z00006w5kwfSAA/how-do-you-get-the-column-names-for-a-foreign-key-constraint
+		//
+		//query = `
+		//SELECT
+		//	"fk_name" as "constraint_name"
+		//	,"pk_table_name" as "table_name"
+		//	,"pk_column_name" as "column_name"
+		//	,"update_rule" as "update_rule"
+		//	,"delete_rule" as "delete_rule"
+		//	,"fk_table_name" as "referenced_table_name"
+		//	,"fk_column_name" as "referenced_column_name"
+		//	,"fk_schema_name" as "referenced_schema"
+		//FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+		//WHERE
+		//	"pk_schema_name" = 'CORE';`
+		//
+		//if err := db.SelectContext(ctx, &rawForeignKeys, `SHOW IMPORTED KEYS;`); err != nil {
+		//	return nil, fmt.Errorf("Error querying fk relationships %s: %s", schema, err)
+		//}
+		//
+		//if err := db.SelectContext(ctx, &rawForeignKeys, query, schema); err != nil {
+		//	return nil, fmt.Errorf("Error querying foreign key constraints for schema %s: %s", schema, err)
+		//}
+	} else {
+		query = `
 		SELECT   SQL_BUFFER_RESULT
 		         rc.constraint_name AS constraint_name, rc.table_name AS table_name,
 		         kcu.column_name AS column_name,
@@ -450,9 +531,12 @@ func queryForeignKeysInSchema(ctx context.Context, db *sqlx.DB, schema string, f
 		                                 kcu.referenced_column_name IS NOT NULL
 		WHERE    rc.constraint_schema = ?
 		ORDER BY BINARY rc.constraint_name, kcu.ordinal_position`
-	if err := db.SelectContext(ctx, &rawForeignKeys, query, schema, schema); err != nil {
-		return nil, fmt.Errorf("Error querying foreign key constraints for schema %s: %s", schema, err)
+
+		if err := db.SelectContext(ctx, &rawForeignKeys, query, schema, schema); err != nil {
+			return nil, fmt.Errorf("Error querying foreign key constraints for schema %s: %s", schema, err)
+		}
 	}
+
 	foreignKeysByTableName := make(map[string][]*ForeignKey)
 	foreignKeysByName := make(map[string]*ForeignKey)
 	for _, rawForeignKey := range rawForeignKeys {
@@ -927,7 +1011,45 @@ func querySchemaRoutines(ctx context.Context, db *sqlx.DB, schema string, flavor
 		Definer           string         `db:"definer"`
 		DatabaseCollation string         `db:"database_collation"`
 	}
-	query := `
+
+	var query string
+
+	if flavor.Vendor == VendorSnowflake {
+		query = `
+		SELECT 
+		       f.FUNCTION_NAME AS function_name, 
+               'FUNCTION' AS routine_type,
+		       f.FUNCTION_DEFINITION AS routine_definition,
+               true AS is_deterministic,
+               '' AS sql_data_access,
+		       '' AS security_type,
+		       '' AS sql_mode, 
+               f.comment AS routine_comment,
+		       '' AS definer, 
+               'utf8' AS database_collation
+		FROM   information_schema.functions f
+		WHERE  f.function_catalog = ? AND f.function_definition IS NOT NULL
+
+        UNION
+
+    	SELECT 
+    		       p.procedure_name AS function_name, 
+                   'PROCEDURE' AS routine_type,
+    		       p.procedure_definition AS routine_definition,
+                   true AS is_deterministic,
+                   '' AS sql_data_access,
+    		       '' AS security_type,
+    		       '' AS sql_mode, 
+                   p.comment AS routine_comment,
+    		       '' AS definer, 
+                   'utf8' AS database_collation
+    		FROM   information_schema.procedures p
+    		WHERE  p.procedure_schema = ? AND p.procedure_definition IS NOT NULL;`
+		if err := db.SelectContext(ctx, &rawRoutines, query, schema, schema); err != nil {
+			return nil, fmt.Errorf("Error querying information_schema.routines for schema %s: %s", schema, err)
+		}
+	} else {
+		query = `
 		SELECT SQL_BUFFER_RESULT
 		       r.routine_name AS routine_name, UPPER(r.routine_type) AS routine_type,
 		       r.routine_definition AS routine_definition,
@@ -938,9 +1060,11 @@ func querySchemaRoutines(ctx context.Context, db *sqlx.DB, schema string, flavor
 		       r.definer AS definer, r.database_collation AS database_collation
 		FROM   information_schema.routines r
 		WHERE  r.routine_schema = ? AND routine_definition IS NOT NULL`
-	if err := db.SelectContext(ctx, &rawRoutines, query, schema); err != nil {
-		return nil, fmt.Errorf("Error querying information_schema.routines for schema %s: %s", schema, err)
+		if err := db.SelectContext(ctx, &rawRoutines, query, schema); err != nil {
+			return nil, fmt.Errorf("Error querying information_schema.routines for schema %s: %s", schema, err)
+		}
 	}
+
 	if len(rawRoutines) == 0 {
 		return []*Routine{}, nil
 	}

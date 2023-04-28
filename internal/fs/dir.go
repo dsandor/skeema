@@ -301,8 +301,19 @@ func (dir *Dir) Instances() ([]*tengo.Instance, error) {
 			}
 			net, addr = "tcp", fmt.Sprintf("%s:%d", host, thisPortValue)
 		}
-		dsn := fmt.Sprintf("%s@%s(%s)/?%s", userAndPass, net, addr, params)
-		instance, err := util.NewInstance("mysql", dsn)
+		var dsn string
+
+		if val, ok := dir.Config.CLI.OptionValues["dsn"]; ok {
+			dsn = val
+		} else {
+			dsn = fmt.Sprintf("%s@%s(%s)/?%s", userAndPass, net, addr, params)
+		}
+
+		var instance *tengo.Instance
+		var err error
+
+		instance, err = util.NewInstance(dir.Config.Get("driver"), dsn)
+
 		if err != nil {
 			if password != "" {
 				safeUserPass := user + ":*****"

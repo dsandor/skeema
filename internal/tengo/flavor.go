@@ -17,6 +17,7 @@ const (
 	VendorUnknown Vendor = iota
 	VendorMySQL
 	VendorMariaDB
+	VendorSnowflake
 )
 
 func (v Vendor) String() string {
@@ -25,6 +26,8 @@ func (v Vendor) String() string {
 		return "mysql"
 	case VendorMariaDB:
 		return "mariadb"
+	case VendorSnowflake:
+		return "snowflake"
 	default:
 		return "unknown"
 	}
@@ -195,6 +198,7 @@ var (
 	FlavorMariaDB109  = Flavor{Vendor: VendorMariaDB, Version: Version{10, 9, 0}}
 	FlavorMariaDB1010 = Flavor{Vendor: VendorMariaDB, Version: Version{10, 10, 0}}
 	FlavorMariaDB1011 = Flavor{Vendor: VendorMariaDB, Version: Version{10, 11, 0}}
+	FlavorSnowflake1  = Flavor{Vendor: VendorSnowflake, Version: Version{1, 0, 0}}
 )
 
 // ParseFlavor returns a Flavor value based on the supplied string in format
@@ -225,6 +229,9 @@ func IdentifyFlavor(versionString, versionComment string) (flavor Flavor) {
 	if strings.Contains(versionComment, "percona") || strings.Contains(versionString, "percona") {
 		flavor.Vendor = VendorMySQL
 		flavor.Variants = VariantPercona
+	} else if strings.Contains(versionComment, "snowflake") {
+		flavor.Vendor = VendorSnowflake
+		flavor.Variants = VariantNone
 	} else {
 		for _, attempt := range []Vendor{VendorMariaDB, VendorMySQL} {
 			if vs := attempt.String(); strings.Contains(versionComment, vs) || strings.Contains(versionString, vs) {
@@ -349,6 +356,10 @@ func (fl Flavor) IsMySQL() bool {
 // IsMariaDB returns true if the receiver's Vendor is VendorMariaDB.
 func (fl Flavor) IsMariaDB() bool {
 	return fl.Vendor == VendorMariaDB
+}
+
+func (fl Flavor) IsSnowflake() bool {
+	return fl.Vendor == VendorSnowflake
 }
 
 // Supported returns true if package tengo officially supports this flavor.
