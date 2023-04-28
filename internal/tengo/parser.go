@@ -518,7 +518,13 @@ func processCreateStatement(p *parser, tokens []Token) (stmt *Statement, err err
 	var processor statementProcessor
 	tokens = p.nextTokens(tokens, 20)
 	if len(tokens) >= 2 && tokens[0].typ == TokenWord {
-		processor = createProcessors[strings.ToLower(tokens[0].val)]
+
+		// this if statement handles the case that we are using `create or replace OBJECT` vs 'create OBJECT'.
+		if len(tokens) >= 3 && tokens[0].typ == TokenWord && strings.ToLower(tokens[0].val) == "or" && tokens[2].typ == TokenWord {
+			processor = createProcessors[strings.ToLower(tokens[2].val)]
+		} else {
+			processor = createProcessors[strings.ToLower(tokens[0].val)]
+		}
 	}
 	if processor == nil {
 		processor = processUntilDelimiter
@@ -529,7 +535,18 @@ func processCreateStatement(p *parser, tokens []Token) (stmt *Statement, err err
 func processCreateTable(p *parser, tokens []Token) (*Statement, error) {
 	// Skip past the TABLE token, and ignore the optional IF NOT EXIST
 	// clause
-	_, tokens = p.matchNextSequence(tokens[1:], "if not exists")
+
+	// Find the TABLE token index instead of assuming.
+	var tableTokenIndex = 1
+
+	for i, t := range tokens {
+		if strings.EqualFold(t.val, "table") {
+			tableTokenIndex = i + 1
+			break
+		}
+	}
+
+	_, tokens = p.matchNextSequence(tokens[tableTokenIndex:], "if not exists")
 
 	// Attempt to parse object name; only set statement and object types if
 	// successful

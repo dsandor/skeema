@@ -1,0 +1,5 @@
+create or replace TABLE CATEGORIES (
+	CATEGORY_ID NUMBER(38,0) NOT NULL autoincrement,
+	CATEGORY_NAME VARCHAR(255) NOT NULL,
+	primary key (CATEGORY_ID)
+);
